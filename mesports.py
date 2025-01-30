@@ -33,6 +33,7 @@ import socket
 import re
 import csv
 import codecs
+import os
 
 from pathlib      import Path
 from rich.console import Console
@@ -40,8 +41,15 @@ from rich.table   import Table
 
 from get_iana_db  import download_iana_csv
 
-# Constantes
-LOCAL_CSV_PATH = Path("service-names-port-numbers.csv")
+
+# Répertoire du script
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+# Définir le répertoire du script comme répertoire courant
+os.chdir(SCRIPT_DIR)
+
+# Chemin vers le fichier CSV
+LOCAL_CSV_PATH = SCRIPT_DIR / "service-names-port-numbers.csv"
 
 def load_iana_data():
     """
@@ -178,7 +186,7 @@ def main():
     table.add_column("Protocole\n",        style="cyan",    justify="left")
     table.add_column("Adresse\nlocale",    style="green",   justify="right")
     table.add_column("Port\nlocal",        style="yellow",  justify="left")
-    table.add_column("Service\n",          style="magenta", justify="left")
+    table.add_column("Service\n",          style="magenta", justify="right")
     table.add_column("Processus\n",        style="blue",    justify="left")
     table.add_column("PID\n",              style="red",     justify="right")
     table.add_column("Adresse\ndistante",  style="green",   justify="right")
