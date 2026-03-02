@@ -7,8 +7,7 @@ MesPortsOuverts est maintenant un outil `zsh` base sur des utilitaires externes:
 - affichage interactif: `mestableaux`
 - audit securite IA (optionnel): `ollama`
 
-`messervices` est maintenant maintenu dans un projet distinct:
-`~/Projets/network/messervices`.
+`messervices` est maintenant maintenu dans un projet distinct.
 
 Les anciens scripts Python sont conserves dans `archive/python-legacy/`.
 La base IANA suivie dans le repo sert de copie de reference; le runtime utilise
@@ -101,5 +100,4 @@ Puis:
 source ~/.zshrc
 ```
 
-Pour la documentation `messervices`, voir:
-`~/Projets/network/messervices/README.md`.
+Pour la documentation `messervices`, voir le repo dedie.
