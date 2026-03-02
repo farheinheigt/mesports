@@ -1,74 +1,105 @@
 # MesPortsOuverts
 
-MesPortsOuverts est un outil conçu pour analyser les ports ouverts sur un système macOS. Ce script utilise la commande `lsof` pour extraire les informations sur les connexions réseau, les services associés, et les processus en cours. Il affiche ces informations dans un tableau stylisé grâce à la bibliothèque `rich`. Bien que ce script soit actuellement adapté pour macOS, il pourrait facilement être adapté pour Linux dans de futures versions.
+MesPortsOuverts est maintenant un outil `zsh` base sur des utilitaires externes:
+- collecte: `lsof`
+- parsing: `jc`
+- normalisation et tri: `jq`
+- affichage interactif: `mestableaux`
+- audit securite IA (optionnel): `ollama`
 
-## Fonctionnalités principales
+`messervices` est maintenant maintenu dans un projet distinct:
+`~/Projets/network/messervices`.
 
-- Analyse des ports ouverts en utilisant `lsof`.
-- Identification des services associés aux ports à l'aide de la base officielle de l'IANA.
-- Affichage des connexions réseau avec des informations détaillées sur les processus.
-- Présentation claire des résultats dans un tableau stylisé.
+Les anciens scripts Python sont conserves dans `archive/python-legacy/`.
+La base IANA suivie dans le repo sert de copie de reference; le runtime utilise
+par defaut un cache local non suivi sous `var/iana/`.
 
-## Prérequis
+## Prerequis
 
-- Python 3.x installé.
-- Modules Python suivants :
-  - `rich`
-  - `requests`
+- macOS (ou Linux avec `lsof` compatible)
+- `zsh`
+- `lsof`
+- `jc`
+- `jq`
+- `mestableaux` pour le mode interactif
+- alias de compatibilite encore accepte: `mestables`
+- `curl` pour l'option Ollama
 
-## Installation
+Installation rapide (macOS/Homebrew):
 
-1. Clonez ce dépôt ou téléchargez le script.
-2. Installez les dépendances Python requises avec pip :
-   ```bash
-   pip install rich requests
-   ```
+```bash
+brew install jc jq
+```
 
 ## Utilisation
 
-### Alias recommandé
-Pour une utilisation plus pratique, il est recommandé de créer un alias dans votre fichier shell (par exemple, `.zshrc` ou `.bashrc`) :
+Rendre le script executable (si besoin):
 
 ```bash
-alias portsouverts='python3 /chemin/vers/mesportsouverts.py'
+chmod +x ./bin/mesports
 ```
 
-Rechargez ensuite votre terminal :
+Lancer en mode interactif tabulaire (par defaut, `mestableaux`):
 
 ```bash
-source ~/.zshrc  # ou ~/.bashrc
+./bin/mesports
 ```
 
-### Lancer le script
-
-Pour exécuter le script, utilisez simplement :
+Mode texte simple:
 
 ```bash
-portsouverts
+./bin/mesports --ui plain
 ```
 
-Le script affichera les connexions réseau ouvertes sous forme de tableau détaillé.
+Afficher uniquement les sockets en ecoute:
 
-## Contribution
+```bash
+./bin/mesports --listen-only
+```
 
-Les contributions sont les bienvenues, en particulier pour l'adaptation de ce script à d'autres systèmes d'exploitation comme Linux.
+Lancer un audit securitaire via Ollama:
 
-1. Forkez le projet.
-2. Créez une branche pour vos modifications :
-   ```bash
-   git checkout -b ma-nouvelle-fonctionnalite
-   ```
-3. Committez vos changements :
-   ```bash
-   git commit -m "Ajout d'une nouvelle fonctionnalité"
-   ```
-4. Poussez vos modifications :
-   ```bash
-   git push origin ma-nouvelle-fonctionnalite
-   ```
-5. Ouvrez une Pull Request.
+```bash
+./bin/mesports --security-ollama --ollama-model qwen3:8b
+```
 
-## Licence
+Notes mode securite:
+- `--security-ollama` n'ouvre pas l'interface tabulaire.
+- Le script envoie directement un resume des connexions a Ollama.
+- Si le terminal est interactif, un spinner Rust local est affiche pendant l'analyse.
 
-Ce projet est sous licence MIT. Consultez le fichier `LICENSE` pour plus d'informations.
+Specifier une autre URL Ollama:
 
+```bash
+./bin/mesports --security-ollama --ollama-host http://localhost:11434
+```
+
+## Options CLI
+
+```text
+--ui <mestableaux|mestables|tabiew|plain>
+--listen-only
+--security-ollama
+--ollama-model <model>
+--ollama-host <url>
+--no-iana-update
+--action <info|kill|kill9>
+--pid <pid[,pid...]>
+--id <id[,id...]>
+-h, --help
+```
+
+## Alias recommande
+
+```bash
+alias mesports='/chemin/vers/mesports/bin/mesports'
+```
+
+Puis:
+
+```bash
+source ~/.zshrc
+```
+
+Pour la documentation `messervices`, voir:
+`~/Projets/network/messervices/README.md`.

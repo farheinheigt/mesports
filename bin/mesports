@@ -1,0 +1,768 @@
+#!/usr/bin/env zsh
+
+setopt errexit nounset pipefail
+
+SCRIPT_PATH="${0:A}"
+SCRIPT_DIR="${SCRIPT_PATH:h}"
+MESPORTS_PROJECT_DIR="${MESPORTS_PROJECT_DIR:-${SCRIPT_DIR:h}}"
+IANA_CSV_URL="https://www.iana.org/assignments/service-names-port-numbers/service-names-port-numbers.csv"
+IANA_CSV_BUNDLED_PATH="${MESPORTS_PROJECT_DIR}/service-names-port-numbers.csv"
+IANA_CSV_PATH="${MESPORTS_IANA_CSV_PATH:-$MESPORTS_PROJECT_DIR/var/iana/service-names-port-numbers.csv}"
+
+UI_MODE="mestableaux"
+LISTEN_ONLY=0
+SECURITY_OLLAMA=0
+NO_IANA_UPDATE=0
+OLLAMA_MODEL="qwen3:8b"
+OLLAMA_HOST="http://localhost:11434"
+OLLAMA_TIMEOUT=180
+ACTION=""
+PID_INPUT=""
+ID_INPUT=""
+REFRESH_TABLE_PATH=""
+REFRESH_HOOKS_PATH=""
+INTERNAL_REFRESH=0
+SILENT_MODE=0
+
+TMP_DIR=""
+TCP_JSON=""
+UDP_JSON=""
+NORMALIZED_JSON=""
+ROWS_TSV=""
+ENRICHED_TSV=""
+TABLE_TSV=""
+SERVICE_MAP_TSV=""
+SECURITY_SUMMARY_JSON=""
+OLLAMA_PAYLOAD_JSON=""
+OLLAMA_RESPONSE_JSON=""
+HOOKS_JSON=""
+
+usage() {
+  cat <<'USAGE'
+Usage: mesports [options]
+
+Options:
+  --ui <mestableaux|mestables|tabiew|plain>   Output mode (default: mestableaux)
+  --listen-only                   Keep only LISTEN sockets
+  --security-ollama               Run a security audit via Ollama
+  --ollama-model <model>          Ollama model name (default: qwen3:8b)
+  --ollama-host <url>             Ollama base URL (default: http://localhost:11434)
+  --no-iana-update                Skip automatic IANA CSV refresh
+  --action <info|kill|kill9>      Execute action on a PID
+  --pid <pid[,pid...]>            PID target for --action
+  --id <id[,id...]>               Row ID target (from list) for --action
+  -h, --help                      Show this help
+USAGE
+}
+
+die() {
+  print -u2 -- "[!] $*"
+  exit 1
+}
+
+require_cmd() {
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || die "Commande requise introuvable: $cmd"
+}
+
+is_interactive_tty() {
+  [[ -t 1 && -t 2 && -n "${TERM:-}" ]]
+}
+
+cleanup() {
+  [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
+
+setup_tmp_files() {
+  TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mesports.XXXXXX")"
+  TCP_JSON="$TMP_DIR/tcp.json"
+  UDP_JSON="$TMP_DIR/udp.json"
+  NORMALIZED_JSON="$TMP_DIR/normalized.json"
+  ROWS_TSV="$TMP_DIR/rows.tsv"
+  ENRICHED_TSV="$TMP_DIR/enriched.tsv"
+  TABLE_TSV="$TMP_DIR/table.tsv"
+  SERVICE_MAP_TSV="$TMP_DIR/service_map.tsv"
+  SECURITY_SUMMARY_JSON="$TMP_DIR/security_summary.json"
+  OLLAMA_PAYLOAD_JSON="$TMP_DIR/ollama_payload.json"
+  OLLAMA_RESPONSE_JSON="$TMP_DIR/ollama_response.json"
+  HOOKS_JSON="$TMP_DIR/hooks.json"
+}
+
+get_mtime_epoch() {
+  local path="$1"
+  if [[ -x /usr/bin/stat ]] && /usr/bin/stat -f %m "$path" >/dev/null 2>&1; then
+    /usr/bin/stat -f %m "$path"
+    return 0
+  fi
+
+  if command -v stat >/dev/null 2>&1; then
+    if stat -f %m "$path" >/dev/null 2>&1; then
+      stat -f %m "$path"
+      return 0
+    fi
+    if stat -c %Y "$path" >/dev/null 2>&1; then
+      stat -c %Y "$path"
+      return 0
+    fi
+  fi
+
+  if command -v gstat >/dev/null 2>&1; then
+    gstat -c %Y "$path"
+    return 0
+  fi
+
+  die "Impossible de recuperer la date de modification pour: $path"
+}
+
+is_iana_update_needed() {
+  [[ ! -f "$IANA_CSV_PATH" ]] && return 0
+
+  local now_epoch last_epoch
+  now_epoch="$(date +%s)"
+  last_epoch="$(get_mtime_epoch "$IANA_CSV_PATH")"
+
+  (( now_epoch - last_epoch > 86400 ))
+}
+
+seed_iana_csv_if_missing() {
+  [[ -f "$IANA_CSV_PATH" ]] && return 0
+
+  mkdir -p "${IANA_CSV_PATH:h}"
+
+  if [[ -f "$IANA_CSV_BUNDLED_PATH" && "$IANA_CSV_PATH" != "$IANA_CSV_BUNDLED_PATH" ]]; then
+    cp "$IANA_CSV_BUNDLED_PATH" "$IANA_CSV_PATH"
+    return 0
+  fi
+}
+
+download_iana_csv() {
+  seed_iana_csv_if_missing
+
+  if [[ "$NO_IANA_UPDATE" -eq 1 ]]; then
+    return 0
+  fi
+
+  if is_iana_update_needed; then
+    print -- "[+] Mise a jour de la base IANA..."
+    mkdir -p "${IANA_CSV_PATH:h}"
+    local tmp_file="$TMP_DIR/service-names-port-numbers.csv.tmp"
+    if is_interactive_tty && [[ -x "$SCRIPT_DIR/mesports-spin" ]]; then
+      "$SCRIPT_DIR/mesports-spin" --title "Telechargement base IANA..." -- \
+        curl -fsSL "$IANA_CSV_URL" -o "$tmp_file"
+    else
+      curl -fsSL "$IANA_CSV_URL" -o "$tmp_file"
+    fi
+    mv "$tmp_file" "$IANA_CSV_PATH"
+    print -- "[+] Base IANA telechargee."
+  fi
+}
+
+collect_protocol_json() {
+  local proto="$1"
+  local out_file="$2"
+
+  if ! lsof +c 300 -nP -i"$proto" 2>/dev/null | jc --lsof > "$out_file"; then
+    print -- "[]" > "$out_file"
+    return 0
+  fi
+
+  jq --arg proto "$proto" '
+    if type == "array" then
+      map(. + {protocol_session: $proto})
+    else
+      []
+    end
+  ' "$out_file" > "$out_file.tmp"
+  mv "$out_file.tmp" "$out_file"
+}
+
+normalize_records() {
+  jq -s '
+    def decode_command: gsub("\\\\x20"; " ");
+
+    def parse_endpoint:
+      if . == null or . == "" then
+        {address: "*", port: 0}
+      elif test("^\\[[^\\]]+\\]:[0-9]+$") then
+        capture("^\\[(?<address>[^\\]]+)\\]:(?<port>[0-9]+)$") | .port |= tonumber
+      elif test("^.*:[0-9]+$") then
+        capture("^(?<address>.*):(?<port>[0-9]+)$") | .port |= tonumber
+      else
+        {address: ., port: 0}
+      end;
+
+    def parse_conn_name:
+      (. // "") as $n
+      | (($n | capture("^(?<local>[^ ]+?)(?:->(?<remote>[^ ]+))?(?: \\((?<state>[^)]+)\\))?$")?) // {local:"", remote:"", state:""});
+
+    (add // [])
+    | map(select(.name != null))
+    | map(
+        (.name | parse_conn_name) as $conn
+        | ($conn.local | parse_endpoint) as $local
+        | ($conn.remote | parse_endpoint) as $remote
+        | {
+            user: (.user // ""),
+            type: (.type // ""),
+            protocol: (.protocol_session // ""),
+            local_address: ($local.address // "*"),
+            local_port: ($local.port // 0),
+            process_name: ((.command // "") | decode_command),
+            pid: ((.pid // "") | tostring),
+            remote_address: (if ($conn.remote // "") == "" then "*" else ($remote.address // "*") end),
+            remote_port: (if ($conn.remote // "") == "" then 0 else ($remote.port // 0) end),
+            state: ($conn.state // "")
+          }
+      )
+    | sort_by((.process_name | ascii_downcase), .local_port)
+  ' "$TCP_JSON" "$UDP_JSON" > "$NORMALIZED_JSON"
+
+  if [[ "$LISTEN_ONLY" -eq 1 ]]; then
+    jq 'map(select((.state | ascii_upcase) == "LISTEN"))' "$NORMALIZED_JSON" > "$NORMALIZED_JSON.tmp"
+    mv "$NORMALIZED_JSON.tmp" "$NORMALIZED_JSON"
+  fi
+}
+
+build_table_tsv() {
+  jq -r '.[] | [
+    .user,
+    .type,
+    .protocol,
+    .local_address,
+    (.local_port | tostring),
+    .process_name,
+    .pid,
+    .remote_address,
+    (.remote_port | tostring),
+    .state
+  ] | @tsv' "$NORMALIZED_JSON" > "$ROWS_TSV"
+
+  awk -F',' -v OFS='\t' '
+    function trim(s) {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+      return s
+    }
+
+    FNR == 1 { next }
+    {
+      service_name = trim($1)
+      port_number = trim($2)
+      transport = tolower(trim($3))
+
+      gsub(/^"|"$/, "", service_name)
+      gsub(/^"|"$/, "", port_number)
+      gsub(/^"|"$/, "", transport)
+
+      if (port_number ~ /^[0-9]+$/ && (transport == "tcp" || transport == "udp") && service_name != "") {
+        key = transport ":" port_number
+        if (!(key in seen)) {
+          seen[key] = 1
+          print key, service_name
+        }
+      }
+    }
+  ' "$IANA_CSV_PATH" > "$SERVICE_MAP_TSV"
+
+  awk -F'\t' -v OFS='\t' '
+    NR == FNR {
+      services[$1] = $2
+      next
+    }
+    {
+      key = tolower($3) ":" $5
+      service_name = (key in services) ? services[key] : "Unknown Service"
+      print $1, $2, $3, $4, $5, service_name, $6, $7, $8, $9, $10
+    }
+  ' "$SERVICE_MAP_TSV" "$ROWS_TSV" > "$ENRICHED_TSV"
+
+  {
+    print -- "ID\tUtilisateur\tType\tProtocole\tAdresse_locale\tPort_local\tService\tProcessus\tPID\tAdresse_distante\tPort_distant\tEtat"
+    awk -F'\t' -v OFS='\t' '{ print NR, $0 }' "$ENRICHED_TSV"
+  } > "$TABLE_TSV"
+}
+
+run_ollama_security_audit() {
+  [[ "$SECURITY_OLLAMA" -eq 1 ]] || return 0
+
+  require_cmd curl
+
+  jq '
+    def state_eq($s): ((.state // "") | ascii_upcase) == $s;
+    def public_bind: (.local_address == "*" or .local_address == "0.0.0.0" or .local_address == "::");
+    {
+      totals: {
+        connections: length,
+        listen: (map(select(state_eq("LISTEN"))) | length),
+        established: (map(select(state_eq("ESTABLISHED"))) | length),
+        close_wait: (map(select(state_eq("CLOSE_WAIT"))) | length),
+        closed: (map(select(state_eq("CLOSED"))) | length)
+      },
+      top_processes: (
+        group_by(.process_name)
+        | map({
+            process: (.[0].process_name // ""),
+            total: length,
+            listen: (map(select(state_eq("LISTEN"))) | length)
+          })
+        | sort_by(-.total)
+        | .[:15]
+      ),
+      listening_public: (
+        map(select(state_eq("LISTEN") and public_bind))
+        | map({
+            process: .process_name,
+            pid: .pid,
+            proto: .protocol,
+            local_address: .local_address,
+            local_port: .local_port
+          })
+        | unique
+        | sort_by(.local_port, .process)
+      ),
+      listening_loopback: (
+        map(select(state_eq("LISTEN") and (.local_address == "127.0.0.1" or .local_address == "::1")))
+        | map({
+            process: .process_name,
+            pid: .pid,
+            proto: .protocol,
+            local_address: .local_address,
+            local_port: .local_port
+          })
+        | unique
+        | sort_by(.local_port, .process)
+        | .[:40]
+      ),
+      external_established_sample: (
+        map(select(state_eq("ESTABLISHED")
+          and .remote_address != "*"
+          and .remote_address != "127.0.0.1"
+          and .remote_address != "::1"))
+        | map({
+            process: .process_name,
+            pid: .pid,
+            local_port: .local_port,
+            remote_address: .remote_address,
+            remote_port: .remote_port
+          })
+        | .[:60]
+      )
+    }
+  ' "$NORMALIZED_JSON" > "$SECURITY_SUMMARY_JSON"
+
+  local payload
+  payload="$(jq -n \
+    --arg model "$OLLAMA_MODEL" \
+    --slurpfile summary "$SECURITY_SUMMARY_JSON" '
+      {
+        model: $model,
+        stream: false,
+        think: false,
+        options: {
+          temperature: 0.2,
+          num_predict: 700
+        },
+        messages: [
+          {
+            role: "system",
+            content: "Tu es un analyste securite reseau. Reponds uniquement en francais, de facon concise et actionnable. Ne pas inventer: si un point est incertain, ecris \"a verifier\"."
+          },
+          {
+            role: "user",
+            content:
+              "Analyse ce resume reseau local. Donne exactement:\\n" +
+              "1) Risques prioritaires (max 5 puces)\\n" +
+              "2) Verifications recommandees (max 5 puces)\\n" +
+              "3) Commandes immediates (max 8 commandes shell, une par ligne).\\n\\n" +
+              "JSON: " + ($summary[0] | tojson)
+          }
+        ]
+      }
+    ')"
+
+  print -r -- "$payload" > "$OLLAMA_PAYLOAD_JSON"
+
+  if [[ -t 1 && -t 2 && -n "${TERM:-}" && -x "$SCRIPT_DIR/mesports-spin" ]]; then
+    if ! "$SCRIPT_DIR/mesports-spin" --title "Analyse securitaire Ollama (${OLLAMA_MODEL})..." -- \
+      curl -fsS --connect-timeout 5 --max-time "$OLLAMA_TIMEOUT" \
+      -H 'Content-Type: application/json' "$OLLAMA_HOST/api/chat" \
+      --data-binary "@$OLLAMA_PAYLOAD_JSON" \
+      -o "$OLLAMA_RESPONSE_JSON"; then
+      die "Echec de l'appel Ollama sur $OLLAMA_HOST. Verifie que le serveur est actif."
+    fi
+  else
+    print -- "\n[+] Analyse securitaire Ollama (${OLLAMA_MODEL})..."
+    if ! curl -fsS --connect-timeout 5 --max-time "$OLLAMA_TIMEOUT" \
+      -H 'Content-Type: application/json' "$OLLAMA_HOST/api/chat" \
+      --data-binary "@$OLLAMA_PAYLOAD_JSON" \
+      -o "$OLLAMA_RESPONSE_JSON"; then
+      die "Echec de l'appel Ollama sur $OLLAMA_HOST. Verifie que le serveur est actif."
+    fi
+  fi
+
+  local response
+  if ! response="$(cat "$OLLAMA_RESPONSE_JSON")"; then
+    die "Echec de l'appel Ollama sur $OLLAMA_HOST. Verifie que le serveur est actif."
+  fi
+
+  local sanitized_response
+  sanitized_response="$(print -r -- "$response" | tr -d '\000-\010\013\014\016-\037')"
+
+  local report
+  report="$(print -r -- "$sanitized_response" | jq -er '.message.content // .error // empty' 2>/dev/null || true)"
+  if [[ -z "$report" ]]; then
+    report="$response"
+  fi
+
+  print -- "$report"
+}
+
+print_scan_summary() {
+  local count
+  count="$(jq 'length' "$NORMALIZED_JSON")"
+
+  print -- "[+] Scanning open ports and processes..."
+  print -- "${count} connexions trouvees :"
+}
+
+collect_with_feedback() {
+  if [[ "$SILENT_MODE" -eq 1 ]]; then
+    collect_protocol_json "TCP" "$TCP_JSON"
+    collect_protocol_json "UDP" "$UDP_JSON"
+    normalize_records
+    build_table_tsv
+    return 0
+  fi
+
+  if is_interactive_tty && [[ -x "$SCRIPT_DIR/mesports-spin" ]]; then
+    (
+      collect_protocol_json "TCP" "$TCP_JSON"
+      collect_protocol_json "UDP" "$UDP_JSON"
+      normalize_records
+      build_table_tsv
+    ) &
+    local collect_pid=$!
+    "$SCRIPT_DIR/mesports-spin" --title "Analyse des ports et sockets..." --pid "$collect_pid" || true
+    local rc=0
+    wait "$collect_pid" || rc=$?
+    return "$rc"
+  fi
+
+  collect_protocol_json "TCP" "$TCP_JSON"
+  collect_protocol_json "UDP" "$UDP_JSON"
+  normalize_records
+  build_table_tsv
+}
+
+print_plain_table() {
+  if command -v column >/dev/null 2>&1; then
+    column -t -s $'\t' "$TABLE_TSV"
+  else
+    cat "$TABLE_TSV"
+  fi
+}
+
+build_hooks_manifest() {
+  jq -n --arg script "$SCRIPT_PATH" '
+    {
+      version: "1",
+      context: "mesports",
+      row_id_field: "ID",
+      actions: [
+        {
+          key: "i",
+          label: "Info",
+          command: ($script + " --action info --pid ${ROW_PID} --ui plain"),
+          confirm: false,
+          destructive: false,
+          refresh_after: false,
+          visible_when: "PID nonempty"
+        },
+        {
+          key: "k",
+          label: "Kill",
+          command: ($script + " --action kill --pid ${ROW_PID} --ui plain"),
+          confirm: true,
+          destructive: true,
+          refresh_after: true,
+          visible_when: "PID nonempty"
+        },
+        {
+          key: "K",
+          label: "Kill -9",
+          command: ($script + " --action kill9 --pid ${ROW_PID} --ui plain"),
+          confirm: true,
+          destructive: true,
+          refresh_after: true,
+          visible_when: "PID nonempty"
+        }
+      ]
+    }
+  ' > "$HOOKS_JSON"
+}
+
+run_mestableaux_ui() {
+  require_cmd jq
+  local table_ui_cmd
+  table_ui_cmd="$(resolve_table_ui_cmd)"
+  build_hooks_manifest
+
+  local refresh_cmd
+  refresh_cmd="$SCRIPT_PATH --ui plain"
+  if [[ "$LISTEN_ONLY" -eq 1 ]]; then
+    refresh_cmd="$refresh_cmd --listen-only"
+  fi
+  if [[ "$NO_IANA_UPDATE" -eq 1 ]]; then
+    refresh_cmd="$refresh_cmd --no-iana-update"
+  fi
+  refresh_cmd="$refresh_cmd --__mestableaux-refresh-table ${(q)TABLE_TSV} --__mestableaux-refresh-hooks ${(q)HOOKS_JSON}"
+
+  "$table_ui_cmd" --theme auto --format tsv --hooks "$HOOKS_JSON" --title "mesports" \
+    --state-key "mesports" \
+    --default-sort "Processus:asc" \
+    --refresh-cmd "$refresh_cmd" "$TABLE_TSV"
+}
+
+resolve_table_ui_cmd() {
+  if command -v mestableaux >/dev/null 2>&1; then
+    print -r -- "mestableaux"
+    return 0
+  fi
+
+  if command -v mestables >/dev/null 2>&1; then
+    print -r -- "mestables"
+    return 0
+  fi
+
+  die "Commande requise introuvable: mestableaux (ou alias mestables)"
+}
+
+print_output() {
+  if [[ "$UI_MODE" == "mestableaux" && is_interactive_tty ]]; then
+    run_mestableaux_ui
+    return 0
+  fi
+
+  print_scan_summary
+
+  if [[ "$UI_MODE" == "mestableaux" ]]; then
+    print -- "[i] TTY non interactif detecte, fallback en mode plain."
+  fi
+
+  print_plain_table
+  print -- "[i] Actions CLI: mesports --action <info|kill|kill9> --pid <PID> | --id <ID>"
+}
+
+normalize_numeric_list() {
+  local raw="$1"
+  print -r -- "$raw" | tr ',;' ' ' | tr -s '[:space:]' '\n' | sed '/^$/d'
+}
+
+validate_pid() {
+  local pid="$1"
+  [[ "$pid" =~ '^[0-9]+$' ]] || die "PID invalide: $pid"
+}
+
+validate_id() {
+  local id="$1"
+  [[ "$id" =~ '^[0-9]+$' ]] || die "ID invalide: $id"
+}
+
+pid_from_display_id() {
+  local id="$1"
+  awk -F'\t' -v id="$id" 'NR > 1 && $1 == id { print $9; exit }' "$TABLE_TSV"
+}
+
+run_info_action() {
+  local pid="$1"
+  require_cmd witr
+  witr --pid "$pid"
+}
+
+run_action_for_pid() {
+  local pid="$1"
+  local action="$2"
+
+  validate_pid "$pid"
+
+  case "$action" in
+    info)
+      run_info_action "$pid"
+      ;;
+    kill)
+      kill "$pid"
+      ;;
+    kill9)
+      kill -9 "$pid"
+      ;;
+    *)
+      die "Action non supportee: $action"
+      ;;
+  esac
+}
+
+run_action() {
+  [[ -n "$ACTION" ]] || return 0
+  if [[ -z "$PID_INPUT" && -z "$ID_INPUT" ]]; then
+    die "--action exige --pid ou --id"
+  fi
+
+  local pid id
+
+  if [[ -n "$PID_INPUT" ]]; then
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] || continue
+      run_action_for_pid "$pid" "$ACTION"
+    done < <(normalize_numeric_list "$PID_INPUT")
+    return 0
+  fi
+
+  setup_tmp_files
+  download_iana_csv
+  collect_protocol_json "TCP" "$TCP_JSON"
+  collect_protocol_json "UDP" "$UDP_JSON"
+  normalize_records
+  build_table_tsv
+
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    validate_id "$id"
+    pid="$(pid_from_display_id "$id")"
+    [[ -n "$pid" ]] || die "ID introuvable dans la liste courante: $id"
+    run_action_for_pid "$pid" "$ACTION"
+  done < <(normalize_numeric_list "$ID_INPUT")
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ui)
+        [[ $# -ge 2 ]] || die "Option --ui attend une valeur"
+        UI_MODE="$2"
+        shift 2
+        ;;
+      --listen-only)
+        LISTEN_ONLY=1
+        shift
+        ;;
+      --security-ollama)
+        SECURITY_OLLAMA=1
+        shift
+        ;;
+      --ollama-model)
+        [[ $# -ge 2 ]] || die "Option --ollama-model attend une valeur"
+        OLLAMA_MODEL="$2"
+        shift 2
+        ;;
+      --ollama-host)
+        [[ $# -ge 2 ]] || die "Option --ollama-host attend une valeur"
+        OLLAMA_HOST="$2"
+        shift 2
+        ;;
+      --no-iana-update)
+        NO_IANA_UPDATE=1
+        shift
+        ;;
+      --action)
+        [[ $# -ge 2 ]] || die "Option --action attend une valeur"
+        ACTION="$2"
+        shift 2
+        ;;
+      --pid)
+        [[ $# -ge 2 ]] || die "Option --pid attend une valeur"
+        PID_INPUT="$2"
+        shift 2
+        ;;
+      --id)
+        [[ $# -ge 2 ]] || die "Option --id attend une valeur"
+        ID_INPUT="$2"
+        shift 2
+        ;;
+      --__mestableaux-refresh-table|--__mestables-refresh-table)
+        [[ $# -ge 2 ]] || die "Option --__mestableaux-refresh-table attend une valeur"
+        REFRESH_TABLE_PATH="$2"
+        INTERNAL_REFRESH=1
+        SILENT_MODE=1
+        shift 2
+        ;;
+      --__mestableaux-refresh-hooks|--__mestables-refresh-hooks)
+        [[ $# -ge 2 ]] || die "Option --__mestableaux-refresh-hooks attend une valeur"
+        REFRESH_HOOKS_PATH="$2"
+        INTERNAL_REFRESH=1
+        SILENT_MODE=1
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Option inconnue: $1"
+        ;;
+    esac
+  done
+
+  case "$UI_MODE" in
+    mestableaux|mestables|tabiew|plain) ;;
+    *) die "Valeur invalide pour --ui: $UI_MODE (attendu: mestableaux|mestables|tabiew|plain)" ;;
+  esac
+
+  if [[ "$UI_MODE" == "tabiew" || "$UI_MODE" == "mestables" ]]; then
+    UI_MODE="mestableaux"
+  fi
+
+  if [[ -n "$ACTION" ]]; then
+    case "$ACTION" in
+      info|kill|kill9) ;;
+      *) die "Valeur invalide pour --action: $ACTION" ;;
+    esac
+
+    if [[ -n "$PID_INPUT" && -n "$ID_INPUT" ]]; then
+      die "--action accepte soit --pid soit --id, pas les deux"
+    fi
+  fi
+
+  if [[ "$INTERNAL_REFRESH" -eq 1 ]]; then
+    [[ -n "$REFRESH_TABLE_PATH" ]] || die "--__mestableaux-refresh-table requis"
+    [[ -n "$REFRESH_HOOKS_PATH" ]] || die "--__mestableaux-refresh-hooks requis"
+  fi
+}
+
+main() {
+  parse_args "$@"
+
+  if [[ -n "$ACTION" ]]; then
+    run_action
+    exit 0
+  fi
+
+  require_cmd lsof
+  require_cmd jc
+  require_cmd jq
+
+  setup_tmp_files
+
+  if [[ "$INTERNAL_REFRESH" -eq 1 ]]; then
+    mkdir -p "${REFRESH_TABLE_PATH:h}" "${REFRESH_HOOKS_PATH:h}"
+    TABLE_TSV="$REFRESH_TABLE_PATH"
+    HOOKS_JSON="$REFRESH_HOOKS_PATH"
+
+    download_iana_csv
+    collect_with_feedback
+    build_hooks_manifest
+    exit 0
+  fi
+
+  download_iana_csv
+  collect_with_feedback
+
+  if [[ "$SECURITY_OLLAMA" -eq 1 ]]; then
+    print_scan_summary
+    run_ollama_security_audit
+    return 0
+  fi
+
+  print_output
+}
+
+main "$@"
